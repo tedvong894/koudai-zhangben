@@ -20,7 +20,8 @@ const Store = (() => {
     curMonth: 'yy_current_month',
     syncOn: 'yy_sync_on',
     dirty: 'yy_dirty',
-    lastSync: 'yy_last_sync'
+    lastSync: 'yy_last_sync',
+    deleted: 'yy_deleted'
   };
 
   // 免登录：ledgers 表里的一个「保留行」充当同步载体，个人多端（Mac/iPhone）共享同一份数据
@@ -84,6 +85,46 @@ const Store = (() => {
     localStorage.setItem(LS.dirty, '1');
     schedulePush();
   }
+  // ---------- 删除墓碑（tombstone）----------
+  // 整份覆盖式同步（last-write-wins）的致命缺陷：只要有一台设备把自己那份「还带着
+  // 已删除记录」的完整数据推上云，别处刚删掉的记录就会复活。故把「删除」本身也做成
+  // 可同步的数据：{ id: 删除时间 }。规则——删过的 id 一律不再出现，任何设备都必须
+  // 服从，从而实现「本地删除优先级高于云端」。
+  function readDeleted() {
+    try { const o = JSON.parse(localStorage.getItem(LS.deleted)); return (o && typeof o === 'object') ? o : {}; }
+    catch (e) { return {}; }
+  }
+  function writeDeleted(o) { localStorage.setItem(LS.deleted, JSON.stringify(o || {})); }
+  function addTombstone(id) {
+    if (!id) return;
+    const d = readDeleted();
+    d[id] = new Date().toISOString();
+    const keys = Object.keys(d);
+    if (keys.length > 800) {           // 控制体积：只保留最近的 800 条
+      keys.sort((a, b) => String(d[a]).localeCompare(String(d[b])));
+      keys.slice(0, keys.length - 800).forEach(k => delete d[k]);
+    }
+    writeDeleted(d);
+  }
+  function mergeTombstones(a, b) {
+    const out = { ...(a || {}) };
+    for (const k in (b || {})) {
+      if (!out[k] || String(b[k]) < String(out[k])) out[k] = b[k];  // 取更早的删除时间
+    }
+    return out;
+  }
+  // 把「已删除」的记录从本地各表中真正清掉
+  function purgeDeleted(idsMap) {
+    const ids = new Set(Object.keys(idsMap || {}));
+    if (!ids.size) return false;
+    let changed = false;
+    [LS.transactions, LS.budgets, LS.ledgers, LS.categories, LS.assets, LS.recurring].forEach(k => {
+      const arr = readArr(k);
+      const n = arr.filter(x => !x || !ids.has(x.id));
+      if (n.length !== arr.length) { writeArr(k, n); changed = true; }
+    });
+    return changed;
+  }
   let pushTimer = null;
   function schedulePush() {
     if (pushTimer) clearTimeout(pushTimer);
@@ -96,7 +137,8 @@ const Store = (() => {
       transactions: readArr(LS.transactions),
       budgets: readArr(LS.budgets),
       assets: readArr(LS.assets),
-      recurring: readArr(LS.recurring)
+      recurring: readArr(LS.recurring),
+      deleted: readDeleted()          // 删除墓碑：随数据一起同步，防止被其它设备"复活"
     };
   }
   function applyBlob(blob) {
@@ -178,6 +220,11 @@ const Store = (() => {
       let blob = null;
       try { blob = JSON.parse(data.name); } catch (e) { blob = null; }
       const valid = blob && Array.isArray(blob.ledgers) && Array.isArray(blob.transactions);
+      // 先合并墓碑（本机 + 云端），并立即把已删除记录从本地清掉：
+      // 删除优先级高于"整份覆盖"，保证本地刚删的记录不会被云端文档带回来。
+      const merged = mergeTombstones(readDeleted(), (valid && blob && blob.deleted) || {});
+      writeDeleted(merged);
+      const purged = purgeDeleted(merged);
       if (isDirty()) {                   // 拉取守卫：本地有未同步改动 → 只推不拉，避免覆盖刚做的操作
         await pushState();
         return;
@@ -187,6 +234,7 @@ const Store = (() => {
         return;
       }
       applyBlob(normalizeBlob(blob));    // 先归一并账本，再整体替换本地（云端为权威）
+      purgeDeleted(merged);              // 云端文档里若还残留已删除记录，再清一次
       localStorage.setItem(LS.lastSync, data.updated_at || new Date().toISOString());
       if (onCloudChangeCb) onCloudChangeCb(true); // 传入 true → 整页重载
     } catch (e) { }
@@ -258,6 +306,7 @@ const Store = (() => {
   }
   async function deleteLedger(id) {
     writeArr(LS.ledgers, readArr(LS.ledgers).filter(x => x.id !== id));
+    addTombstone(id);
     markDirty();
   }
 
@@ -275,6 +324,7 @@ const Store = (() => {
   }
   async function deleteCategory(id) {
     writeArr(LS.categories, readArr(LS.categories).filter(x => x.id !== id));
+    addTombstone(id);
     markDirty();
   }
 
@@ -299,6 +349,7 @@ const Store = (() => {
   }
   async function deleteTransaction(id) {
     writeArr(LS.transactions, readArr(LS.transactions).filter(x => x.id !== id));
+    addTombstone(id);
     markDirty();
   }
   function getTransaction(id) { return readArr(LS.transactions).find(x => x.id === id) || null; }
@@ -318,6 +369,7 @@ const Store = (() => {
   }
   async function deleteRecurring(id) {
     writeArr(LS.recurring, readArr(LS.recurring).filter(x => x.id !== id));
+    addTombstone(id);
     markDirty();
   }
 
@@ -340,6 +392,7 @@ const Store = (() => {
   }
   async function deleteBudget(id) {
     writeArr(LS.budgets, readArr(LS.budgets).filter(x => x.id !== id));
+    addTombstone(id);
     markDirty();
   }
 
@@ -359,6 +412,7 @@ const Store = (() => {
   }
   async function deleteAsset(id) {
     writeArr(LS.assets, readArr(LS.assets).filter(x => x.id !== id));
+    addTombstone(id);
     markDirty();
   }
 
