@@ -52,7 +52,12 @@
     state.ledgers = await Store.getLedgers();
     state.categories = await Store.getCategories();
     state.assets = await Store.getAssets();
-    if (!state.ledgerId && state.ledgers[0]) state.ledgerId = state.ledgers[0].id;
+    // 账本兜底：当前账本 id 不在账本列表里时，回落到第一个账本。
+    // 否则会按一个已不存在（或来自别的设备）的 ledger_id 过滤交易，
+    // 表现为「资产/账户正常，但记账明细空白」。
+    if (!state.ledgerId || !state.ledgers.some(l => l.id === state.ledgerId)) {
+      state.ledgerId = state.ledgers[0] ? state.ledgers[0].id : null;
+    }
     const savedMonth = localStorage.getItem('yy_current_month');
     if (!state.month) state.month = savedMonth || monthKeyOf(new Date());
   }
