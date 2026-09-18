@@ -130,9 +130,17 @@ const Store = (() => {
       if (keep[k]) { remap[l.id] = keep[k]; continue; }
       keep[k] = l.id; out.push(l);
     }
-    if (!Object.keys(remap).length) return blob;
+    if (!Object.keys(remap).length && out.length >= blob.ledgers.length) return blob;
     const fix = arr => (arr || []).map(x => (x && remap[x.ledger_id]) ? { ...x, ledger_id: remap[x.ledger_id] } : x);
-    return { ...blob, ledgers: out, transactions: fix(blob.transactions), budgets: fix(blob.budgets), recurring: fix(blob.recurring) };
+    let nb = { ...blob, ledgers: out, transactions: fix(blob.transactions), budgets: fix(blob.budgets), recurring: fix(blob.recurring) };
+    // 只剩一个账本时，把所有「孤儿引用」（指向已不存在的账本的记录，例如某设备本地还留着
+    // 自己临时生成的 ledger_id）一并归到唯一账本名下，否则这些明细会永远看不见。
+    if (out.length === 1) {
+      const only = out[0].id;
+      const fixAll = arr => (arr || []).map(x => (x && x.ledger_id !== only) ? { ...x, ledger_id: only } : x);
+      nb = { ...nb, transactions: fixAll(nb.transactions), budgets: fixAll(nb.budgets), recurring: fixAll(nb.recurring) };
+    }
+    return nb;
   }
   // 推送整份本地数据到云端（保留行承载 JSON 大字段，last-write-wins）
   // 注意：该库 PostgREST 对 .upsert() 的合并在「行已存在」时会 409，故改用
