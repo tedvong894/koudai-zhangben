@@ -1471,7 +1471,8 @@
         </div>`;
     }
     const assetTotal = assets.filter(a => !isCredit(a)).reduce((s, a) => s + Number(a.balance), 0);
-    const debtTotal = assets.filter(isCredit).reduce((s, a) => s + Math.abs(Number(a.balance)), 0);
+    // 负债 = 信用卡负余额的绝对值之和（余额为正=溢缴款，不计入负债）
+    const debtTotal = assets.filter(isCredit).reduce((s, a) => s + Math.max(0, -Number(a.balance)), 0);
     view.innerHTML = `
       <div class="net-worth-card">
         <div class="nwc-head">净资产（元）</div>
@@ -1668,11 +1669,12 @@
   }
 
   // 资产余额变动：统一「资金流入该账户→余额加、流出→减」。
-  // 信用卡(kind='credit')余额代表「欠款(负债)」，方向相反：消费(支出)→欠款增→余额加；还款(收入)→欠款减→余额减。
+  // 余额口径（全账户一致，含信用卡）：余额本身就是该账户对净资产的贡献。
+  //   · 普通账户：余额=可用资金，支出→减、收入→增。
+  //   · 信用卡/负债：余额=欠款取负（欠款越多余额越负），故消费→余额减、还款→余额增——方向与普通账户相同。
+  //   净资产 = 所有账户余额直接相加（信用卡负余额天然抵扣），总负债 = Σ max(0, −信用卡余额)。
   function assetDelta(kind, type, amount) {
-    const k = (typeof kind === 'string' && kind) ? kind : 'asset';
-    let sign = (type === 'expense') ? -1 : 1;   // 资产视角：支出减、收入加
-    if (k === 'credit') sign = -sign;              // 信用卡(负债)反向
+    const sign = (type === 'expense') ? -1 : 1;   // 支出减、收入加（信用卡同向，不再反向）
     return sign * Number(amount);
   }
   // 调整某账户余额：factor=+1 应用、factor=-1 回退（用于编辑/删除时重算）
