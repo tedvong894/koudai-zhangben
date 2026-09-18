@@ -1,5 +1,5 @@
 // 口袋账本 Service Worker：缓存 App 外壳，支持离线打开 / 安装到本地
-const CACHE = 'xyjz-v45';
+const CACHE = 'xyjz-v46';
 const SHELL = [
   './',
   './index.html',
