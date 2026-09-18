@@ -28,6 +28,9 @@ const Store = (() => {
   const SYNC_ROW_ID = '00000000-0000-0000-0000-000000000001';
   const SYNC_TABLE = 'ledgers';
   const PROJECT = 'lifeisprg';
+  // 默认账本用固定 id：各设备首次生成的"默认账本"必须是同一个 id，
+  // 否则不同设备各建一个同名账本，交易按 ledger_id 过滤时会互相"看不见"。
+  const DEFAULT_LEDGER_ID = 'ledger-default';
 
   function loadConfig() {
     let c = null;
@@ -105,13 +108,39 @@ const Store = (() => {
     if (Array.isArray(blob.assets)) writeArr(LS.assets, blob.assets);
     if (Array.isArray(blob.recurring)) writeArr(LS.recurring, blob.recurring);
   }
+  // 归一化：合并「同名且无交易的重复账本」。
+  // 多端各自 seed 过默认账本时会累积出多个同名账本；保留有交易的那个，
+  // 把空壳账本（及其引用）改指到保留账本，避免明细按不同 ledger_id 过滤而"看不到"。
+  function normalizeBlob(blob) {
+    if (!blob || !Array.isArray(blob.ledgers) || blob.ledgers.length <= 1) return blob;
+    const txs = blob.transactions || [];
+    const hasTx = id => txs.some(t => t && t.ledger_id === id);
+    const keyOf = l => (l && l.name || '') + '|' + (l && l.icon || '');
+    const keep = {}; const remap = {}; const out = [];
+    // 第一轮：有交易的账本优先占位
+    for (const l of blob.ledgers) {
+      if (!l || !hasTx(l.id)) continue;
+      const k = keyOf(l);
+      if (!keep[k]) { keep[k] = l.id; out.push(l); } else remap[l.id] = keep[k];
+    }
+    // 第二轮：无交易的账本 → 同名并入保留账本，否则保留
+    for (const l of blob.ledgers) {
+      if (!l || hasTx(l.id)) continue;
+      const k = keyOf(l);
+      if (keep[k]) { remap[l.id] = keep[k]; continue; }
+      keep[k] = l.id; out.push(l);
+    }
+    if (!Object.keys(remap).length) return blob;
+    const fix = arr => (arr || []).map(x => (x && remap[x.ledger_id]) ? { ...x, ledger_id: remap[x.ledger_id] } : x);
+    return { ...blob, ledgers: out, transactions: fix(blob.transactions), budgets: fix(blob.budgets), recurring: fix(blob.recurring) };
+  }
   // 推送整份本地数据到云端（保留行承载 JSON 大字段，last-write-wins）
   // 注意：该库 PostgREST 对 .upsert() 的合并在「行已存在」时会 409，故改用
   // 「先 insert，若 409 重复键则降级为 update(PATCH)」的稳妥写法。
   async function pushState() {
     if (!cloudOn || !sb) return;
     try {
-      const payload = { id: SYNC_ROW_ID, name: JSON.stringify(buildBlob()), icon: '', color: '' };
+      const payload = { id: SYNC_ROW_ID, name: JSON.stringify(normalizeBlob(buildBlob())), icon: '', color: '' };
       let res = await sb.from(SYNC_TABLE).insert(payload);
       if (res.error && /23505|duplicate/i.test(res.error.code || res.error.message || '')) {
         res = await sb.from(SYNC_TABLE).update({ name: payload.name, icon: '', color: '' }).eq('id', SYNC_ROW_ID);
@@ -149,7 +178,7 @@ const Store = (() => {
         if (localHasData()) await pushState();
         return;
       }
-      applyBlob(blob);                   // 云端为权威：整体替换本地
+      applyBlob(normalizeBlob(blob));    // 先归一并账本，再整体替换本地（云端为权威）
       localStorage.setItem(LS.lastSync, data.updated_at || new Date().toISOString());
       if (onCloudChangeCb) onCloudChangeCb(true); // 传入 true → 整页重载
     } catch (e) { }
@@ -203,7 +232,7 @@ const Store = (() => {
   async function ensureSeed() {
     const seed = (window.SEED) || { ledgers: [], categories: [], assets: [] };
     if (readArr(LS.categories).length === 0) writeArr(LS.categories, resolveSeedCats(seed.categories));
-    if (readArr(LS.ledgers).length === 0) writeArr(LS.ledgers, seed.ledgers.map(l => ({ ...l, id: uid() })));
+    if (readArr(LS.ledgers).length === 0) writeArr(LS.ledgers, seed.ledgers.map(l => ({ ...l, id: DEFAULT_LEDGER_ID })));
     if (readArr(LS.assets).length === 0) writeArr(LS.assets, seed.assets.map(a => ({ ...a, id: uid() })));
   }
 
