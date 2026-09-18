@@ -1325,11 +1325,26 @@
         data[k] = localStorage.getItem(k);
       }
     }
-    const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+    const json = JSON.stringify(data, null, 2);
+    const filename = '口袋账本备份_' + new Date().toISOString().slice(0, 10) + '.json';
+    // iOS 主屏 PWA 独立模式不支持 a[download] 下载（静默失败）→ 优先走系统分享「存储到文件」
+    const nav = window.navigator;
+    try {
+      if (nav.share && nav.canShare) {
+        const file = new File([json], filename, { type: 'application/json' });
+        if (nav.canShare({ files: [file] })) {
+          nav.share({ files: [file], title: '口袋账本备份' })
+            .then(() => toast('备份已保存到文件 ✓'))
+            .catch(() => { /* 用户取消分享 → 不提示失败 */ });
+          return;
+        }
+      }
+    } catch (e) { /* 分享不可用 → 降级为下载 */ }
+    const blob = new Blob([json], { type: 'application/json' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = '口袋账本备份_' + new Date().toISOString().slice(0, 10) + '.json';
+    a.download = filename;
     document.body.appendChild(a); a.click(); a.remove();
     URL.revokeObjectURL(url);
     toast('已导出备份文件 ✓');
