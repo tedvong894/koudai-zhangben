@@ -1,0 +1,18 @@
+# 依赖 / 临时文件
+node_modules/
+.DS_Store
+*.log
+.tmp/
+.workbuddy/
+
+# 本地私密配置（不要把真实密钥提交到仓库）
+config.local.js
+
+# WorkBuddy 内部应用标识（不要提交）
+.wbapp_*.genie
+
+# 开发脚本 / 构建产物（非站点运行所需）
+gen_icon.py
+package.json
+package-lock.json
+*.sql
