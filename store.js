@@ -1,0 +1,338 @@
+// 数据层：本地优先（localStorage 为主存储，断网照常使用）
+// 联网同步 = 军机处模型：云端整份数据为「ledgers 表里一个保留行」的 JSON 大字段（last-write-wins）+ 脏标记 + 防抖 push-on-edit + 拉取守卫
+// 复用现有 lifeisprg 项目的 ledgers 表，不新建表、不改表结构（避免 schema 不匹配丢字段）。
+// 同步规则：本机编辑即推送云端；其它设备仅在本机「无未同步改动」时拉取云端（有改动则只推不拉，绝不反向覆盖）。
+const Store = (() => {
+  let sb = null;
+  let cloudOn = false;
+  let cfg = { url: '', key: '' };
+  let onCloudChangeCb = null;
+
+  const LS = {
+    ledgers: 'yy_ledgers',
+    categories: 'yy_categories',
+    transactions: 'yy_transactions',
+    budgets: 'yy_budgets',
+    assets: 'yy_assets',
+    recurring: 'yy_recurring',
+    config: 'yy_supabase_config',
+    curLedger: 'yy_current_ledger',
+    curMonth: 'yy_current_month',
+    syncOn: 'yy_sync_on',
+    dirty: 'yy_dirty',
+    lastSync: 'yy_last_sync'
+  };
+
+  // 免登录：ledgers 表里的一个「保留行」充当同步载体，个人多端（Mac/iPhone）共享同一份数据
+  // 用固定 UUID，写入 JSON 大字段，getLedgers() 会过滤掉它，永不显示为账本。
+  const SYNC_ROW_ID = '00000000-0000-0000-0000-000000000001';
+  const SYNC_TABLE = 'ledgers';
+  const PROJECT = 'lifeisprg';
+
+  function loadConfig() {
+    let c = null;
+    try { c = JSON.parse(localStorage.getItem(LS.config)); } catch (e) { }
+    if (!c || !c.url || !c.key) {
+      c = {
+        url: (window.APP_CONFIG && window.APP_CONFIG.SUPABASE_URL) || '',
+        key: (window.APP_CONFIG && window.APP_CONFIG.SUPABASE_ANON_KEY) || ''
+      };
+    }
+    cfg = c;
+  }
+
+  function isLive() { return cloudOn; }
+  function getMode() { return cloudOn ? 'synced' : 'local'; }
+  function getConfig() { return cfg; }
+  function getDocId() { return PROJECT; }
+
+  async function applyConfig(url, key) {
+    cfg = { url: url || '', key: key || '' };
+    if (cfg.url && cfg.key) localStorage.setItem(LS.config, JSON.stringify(cfg));
+    else localStorage.removeItem(LS.config);
+    return await init();
+  }
+
+  function uid() {
+    if (window.crypto && crypto.randomUUID) return crypto.randomUUID();
+    return 'id-' + Date.now() + '-' + Math.random().toString(16).slice(2);
+  }
+
+  // ---------- 本地读写 ----------
+  function readArr(key) { try { return JSON.parse(localStorage.getItem(key)) || []; } catch (e) { return []; } }
+  function writeArr(key, arr) { localStorage.setItem(key, JSON.stringify(arr)); }
+  function todayStr() {
+    const d = new Date();
+    const m = String(d.getMonth() + 1).padStart(2, '0');
+    const day = String(d.getDate()).padStart(2, '0');
+    return `${d.getFullYear()}-${m}-${day}`;
+  }
+  function monthFirstLast(month) {
+    const [y, m] = month.split('-').map(Number);
+    const first = `${month}-01`;
+    const last = new Date(y, m, 0); // 当月最后一天
+    const ld = String(last.getDate()).padStart(2, '0');
+    return { first, last: `${y}-${String(m).padStart(2, '0')}-${ld}` };
+  }
+
+  // ---------- 同步核心（军机处模型）----------
+  function isDirty() { return localStorage.getItem(LS.dirty) === '1'; }
+  function markDirty() {
+    localStorage.setItem(LS.dirty, '1');
+    schedulePush();
+  }
+  let pushTimer = null;
+  function schedulePush() {
+    if (pushTimer) clearTimeout(pushTimer);
+    pushTimer = setTimeout(() => { pushTimer = null; pushState(); }, 250); // 防抖 ~250ms
+  }
+  function buildBlob() {
+    return {
+      ledgers: readArr(LS.ledgers),
+      categories: readArr(LS.categories),
+      transactions: readArr(LS.transactions),
+      budgets: readArr(LS.budgets),
+      assets: readArr(LS.assets),
+      recurring: readArr(LS.recurring)
+    };
+  }
+  function applyBlob(blob) {
+    if (!blob) return;
+    if (Array.isArray(blob.ledgers)) writeArr(LS.ledgers, blob.ledgers);
+    if (Array.isArray(blob.categories)) writeArr(LS.categories, blob.categories);
+    if (Array.isArray(blob.transactions)) writeArr(LS.transactions, blob.transactions);
+    if (Array.isArray(blob.budgets)) writeArr(LS.budgets, blob.budgets);
+    if (Array.isArray(blob.assets)) writeArr(LS.assets, blob.assets);
+    if (Array.isArray(blob.recurring)) writeArr(LS.recurring, blob.recurring);
+  }
+  // 推送整份本地数据到云端（保留行承载 JSON 大字段，last-write-wins）
+  // 注意：该库 PostgREST 对 .upsert() 的合并在「行已存在」时会 409，故改用
+  // 「先 insert，若 409 重复键则降级为 update(PATCH)」的稳妥写法。
+  async function pushState() {
+    if (!cloudOn || !sb) return;
+    try {
+      const payload = { id: SYNC_ROW_ID, name: JSON.stringify(buildBlob()), icon: '', color: '' };
+      let res = await sb.from(SYNC_TABLE).insert(payload);
+      if (res.error && /23505|duplicate/i.test(res.error.code || res.error.message || '')) {
+        res = await sb.from(SYNC_TABLE).update({ name: payload.name, icon: '', color: '' }).eq('id', SYNC_ROW_ID);
+      }
+      if (res.error) return;
+      localStorage.setItem(LS.dirty, '0');
+      localStorage.setItem(LS.lastSync, new Date().toISOString());
+      if (onCloudChangeCb) onCloudChangeCb(false); // 仅刷新状态指示，不整页重载（避免闪烁）
+    } catch (e) { }
+  }
+  // 本地是否已有任何数据（用于首次启用同步时保护既有数据不被空云端覆盖）
+  function localHasData() {
+    return readArr(LS.ledgers).length > 0 || readArr(LS.categories).length > 0 ||
+           readArr(LS.transactions).length > 0 || readArr(LS.budgets).length > 0 ||
+           readArr(LS.assets).length > 0 || readArr(LS.recurring).length > 0;
+  }
+  // 拉取云端（云端为权威）；本地有未同步改动时只推不拉（拉取守卫）；云端空/损坏且本地有数据时只推不拉
+  async function pull() {
+    if (!cloudOn || !sb) return;
+    try {
+      const { data, error } = await sb.from(SYNC_TABLE).select('*').eq('id', SYNC_ROW_ID).maybeSingle();
+      if (error) return;                 // 网络/权限错误：保留本地，绝不覆盖
+      if (!data) {                       // 云端无保留行：首次启用，把本地推上去
+        await pushState();
+        return;
+      }
+      let blob = null;
+      try { blob = JSON.parse(data.name); } catch (e) { blob = null; }
+      const valid = blob && Array.isArray(blob.ledgers) && Array.isArray(blob.transactions);
+      if (isDirty()) {                   // 拉取守卫：本地有未同步改动 → 只推不拉，避免覆盖刚做的操作
+        await pushState();
+        return;
+      }
+      if (!valid) {                      // 云端空/损坏，且本地有数据 → 推本地，绝不反向清空本地
+        if (localHasData()) await pushState();
+        return;
+      }
+      applyBlob(blob);                   // 云端为权威：整体替换本地
+      localStorage.setItem(LS.lastSync, data.updated_at || new Date().toISOString());
+      if (onCloudChangeCb) onCloudChangeCb(true); // 传入 true → 整页重载
+    } catch (e) { }
+  }
+  function flush() { if (cloudOn && isDirty()) pushState(); } // 离开页面兜底（best-effort）
+  function onCloudChange(cb) { onCloudChangeCb = cb; }
+
+  async function syncNow() {
+    if (!cloudOn) return { ok: false, msg: '未启用云端同步' };
+    if (isDirty()) { await pushState(); return { ok: true, msg: '已推送本地改动' }; }
+    await pull();
+    return { ok: true, msg: '已同步' };
+  }
+  function getSyncStatus() {
+    return { on: cloudOn, dirty: isDirty(), lastSync: localStorage.getItem(LS.lastSync) };
+  }
+
+  // ---------- 启动 / 开关 ----------
+  async function init() {
+    loadConfig();
+    const want = localStorage.getItem(LS.syncOn) === '1' && /^https?:\/\//.test(cfg.url || '') && cfg.key;
+    if (want && window.supabase) {
+      try {
+        sb = window.supabase.createClient(cfg.url, cfg.key, { auth: { persistSession: false, autoRefreshToken: false } });
+        cloudOn = true;
+        await ensureSeed();   // 先保证本地有种子/既有数据
+        await pull();         // 首次连接：空则推本地；有改动则守卫；否则采纳云端
+      } catch (e) { sb = null; cloudOn = false; await ensureSeed(); }
+    } else {
+      sb = null; cloudOn = false;
+      await ensureSeed();
+    }
+    return getMode();
+  }
+  function setSyncOn(on) {
+    localStorage.setItem(LS.syncOn, on ? '1' : '0');
+    return init();
+  }
+
+  // ---------- 种子数据 ----------
+  function resolveSeedCats(raw) {
+    const withId = raw.map(c => ({ ...c, id: uid() }));
+    const pkMap = {};
+    withId.forEach(c => { if (c.pk) pkMap[c.pk] = c.id; });
+    return withId.map(c => {
+      const { pk, parentKey, ...rest } = c;
+      const parent = parentKey ? (pkMap[parentKey] || null) : null;
+      return { ...rest, parent };
+    });
+  }
+  async function ensureSeed() {
+    const seed = (window.SEED) || { ledgers: [], categories: [], assets: [] };
+    if (readArr(LS.categories).length === 0) writeArr(LS.categories, resolveSeedCats(seed.categories));
+    if (readArr(LS.ledgers).length === 0) writeArr(LS.ledgers, seed.ledgers.map(l => ({ ...l, id: uid() })));
+    if (readArr(LS.assets).length === 0) writeArr(LS.assets, seed.assets.map(a => ({ ...a, id: uid() })));
+  }
+
+  // ---------- 账本 ----------
+  function getLedgers() { return readArr(LS.ledgers).filter(x => x.id !== SYNC_ROW_ID); }
+  async function saveLedger(obj) {
+    const o = { ...obj };
+    if (!o.id) o.id = uid();
+    const arr = readArr(LS.ledgers);
+    const i = arr.findIndex(x => x.id === o.id);
+    if (i >= 0) arr[i] = o; else arr.push(o);
+    writeArr(LS.ledgers, arr);
+    markDirty();
+    return o;
+  }
+  async function deleteLedger(id) {
+    writeArr(LS.ledgers, readArr(LS.ledgers).filter(x => x.id !== id));
+    markDirty();
+  }
+
+  // ---------- 分类 ----------
+  function getCategories() { return readArr(LS.categories); }
+  async function saveCategory(obj) {
+    const o = { ...obj };
+    if (!o.id) o.id = uid();
+    const arr = readArr(LS.categories);
+    const i = arr.findIndex(x => x.id === o.id);
+    if (i >= 0) arr[i] = o; else arr.push(o);
+    writeArr(LS.categories, arr);
+    markDirty();
+    return o;
+  }
+  async function deleteCategory(id) {
+    writeArr(LS.categories, readArr(LS.categories).filter(x => x.id !== id));
+    markDirty();
+  }
+
+  // ---------- 交易 ----------
+  function getTransactions({ ledgerId, month } = {}) {
+    let arr = readArr(LS.transactions);
+    if (ledgerId) arr = arr.filter(t => t.ledger_id === ledgerId);
+    if (month) arr = arr.filter(t => (t.occurred_at || '').startsWith(month));
+    arr.sort((a, b) => (b.occurred_at + b.created_at).localeCompare(a.occurred_at + a.created_at));
+    return arr;
+  }
+  async function saveTransaction(obj) {
+    const o = { ...obj };
+    if (!o.id) o.id = uid();
+    if (!o.created_at) o.created_at = new Date().toISOString();
+    const arr = readArr(LS.transactions);
+    const i = arr.findIndex(x => x.id === o.id);
+    if (i >= 0) arr[i] = o; else arr.push(o);
+    writeArr(LS.transactions, arr);
+    markDirty();
+    return o;
+  }
+  async function deleteTransaction(id) {
+    writeArr(LS.transactions, readArr(LS.transactions).filter(x => x.id !== id));
+    markDirty();
+  }
+  function getTransaction(id) { return readArr(LS.transactions).find(x => x.id === id) || null; }
+
+  // ---------- 周期记账（规则模板，启动时空生成到期账）----------
+  function getRecurring() { return readArr(LS.recurring); }
+  async function saveRecurring(obj) {
+    const o = { ...obj };
+    if (!o.id) o.id = uid();
+    if (!o.created_at) o.created_at = new Date().toISOString();
+    const arr = readArr(LS.recurring);
+    const i = arr.findIndex(x => x.id === o.id);
+    if (i >= 0) arr[i] = o; else arr.push(o);
+    writeArr(LS.recurring, arr);
+    markDirty();
+    return o;
+  }
+  async function deleteRecurring(id) {
+    writeArr(LS.recurring, readArr(LS.recurring).filter(x => x.id !== id));
+    markDirty();
+  }
+
+  // ---------- 预算 ----------
+  function getBudgets({ ledgerId, month } = {}) {
+    let arr = readArr(LS.budgets);
+    if (ledgerId) arr = arr.filter(b => b.ledger_id === ledgerId);
+    if (month) arr = arr.filter(b => b.month === month);
+    return arr;
+  }
+  async function saveBudget(obj) {
+    const o = { ...obj };
+    if (!o.id) o.id = uid();
+    const arr = readArr(LS.budgets);
+    const i = arr.findIndex(x => x.id === o.id);
+    if (i >= 0) arr[i] = o; else arr.push(o);
+    writeArr(LS.budgets, arr);
+    markDirty();
+    return o;
+  }
+  async function deleteBudget(id) {
+    writeArr(LS.budgets, readArr(LS.budgets).filter(x => x.id !== id));
+    markDirty();
+  }
+
+  // ---------- 资产 ----------
+  function getAssets() {
+    return readArr(LS.assets).sort((a, b) => (a.sort ?? 0) - (b.sort ?? 0) || (a.id < b.id ? -1 : 1));
+  }
+  async function saveAsset(obj) {
+    const o = { ...obj };
+    if (!o.id) o.id = uid();
+    const arr = readArr(LS.assets);
+    const i = arr.findIndex(x => x.id === o.id);
+    if (i >= 0) arr[i] = o; else arr.push(o);
+    writeArr(LS.assets, arr);
+    markDirty();
+    return o;
+  }
+  async function deleteAsset(id) {
+    writeArr(LS.assets, readArr(LS.assets).filter(x => x.id !== id));
+    markDirty();
+  }
+
+  return {
+    init, isLive, getMode, getConfig, getDocId, applyConfig, setSyncOn,
+    getSyncStatus, syncNow, onCloudChange, pull, flush, todayStr,
+    getLedgers, saveLedger, deleteLedger,
+    getCategories, saveCategory, deleteCategory,
+    getTransactions, saveTransaction, deleteTransaction, getTransaction,
+    getRecurring, saveRecurring, deleteRecurring,
+    getBudgets, saveBudget, deleteBudget,
+    getAssets, saveAsset, deleteAsset
+  };
+})();
