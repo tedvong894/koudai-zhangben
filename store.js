@@ -109,9 +109,57 @@ const Store = (() => {
   function mergeTombstones(a, b) {
     const out = { ...(a || {}) };
     for (const k in (b || {})) {
-      if (!out[k] || String(b[k]) < String(out[k])) out[k] = b[k];  // 取更早的删除时间
+      if (!out[k] || String(b[k]) > String(out[k])) out[k] = b[k];  // 取更新的删除时间（新者为准）
     }
     return out;
+  }
+  function tsOf(r) {
+    const t = Date.parse((r && r.updated_at) || '');
+    return isNaN(t) ? 0 : t;
+  }
+  // 数据指纹：用于判断一次同步后本地内容是否真的变了（避免无谓整页重渲染）
+  function blobSig(blob) {
+    const parts = [];
+    ['ledgers', 'categories', 'transactions', 'budgets', 'assets', 'recurring'].forEach(k => {
+      const arr = (blob && blob[k]) || [];
+      parts.push(k + '#' + arr.length + '#' + arr.map(r => ((r && r.id) || '') + '@' + ((r && r.updated_at) || '')).join(','));
+    });
+    parts.push('d#' + Object.keys((blob && blob.deleted) || {}).length);
+    return parts.join('|');
+  }
+  // 逐条合并（本地 ⇄ 云端）：同 id 取 updated_at 较新的一条；
+  // 删除按墓碑时间判定——记录若在该时间之后又被改动过，则以改动为准（复活）。
+  // 返回 { blob, localNewer }：localNewer=true 表示本端有云端还没有的更新/删除，需要回传。
+  function mergeStates(local, cloud) {
+    const tombstones = mergeTombstones(local.deleted, cloud.deleted);
+    let localNewer = false;
+    const out = {};
+    ['ledgers', 'categories', 'transactions', 'budgets', 'assets', 'recurring'].forEach(k => {
+      const L = Array.isArray(local[k]) ? local[k] : [];
+      const C = Array.isArray(cloud[k]) ? cloud[k] : [];
+      const map = new Map();
+      C.forEach(r => { if (r && r.id) map.set(r.id, r); });
+      L.forEach(r => {
+        if (!r || !r.id) return;
+        const cur = map.get(r.id);
+        if (!cur) { map.set(r.id, r); localNewer = true; }
+        else if (tsOf(r) > tsOf(cur)) { map.set(r.id, r); localNewer = true; }
+      });
+      const arr = [];
+      map.forEach(r => {
+        const t = tombstones[r.id];
+        if (t) {
+          const tt = Date.parse(t);
+          if (!(tsOf(r) > (isNaN(tt) ? 0 : tt))) return;   // 已删除且之后没再改过 → 排除
+        }
+        arr.push(r);
+      });
+      out[k] = arr;
+    });
+    const cd = cloud.deleted || {};
+    for (const id in (local.deleted || {})) { if (!cd[id]) { localNewer = true; break; } }
+    out.deleted = tombstones;
+    return { blob: out, localNewer };
   }
   // 把「已删除」的记录从本地各表中真正清掉
   function purgeDeleted(idsMap) {
@@ -184,18 +232,35 @@ const Store = (() => {
     }
     return nb;
   }
-  // 推送整份本地数据到云端（保留行承载 JSON 大字段，last-write-wins）
+  // 推送：先读云端 → 逐条合并（较新者为准）→ 写回云端，并把合并结果落到本地。
+  // 这样任何设备都不会用旧数据盖掉别处的新数据（编辑和删除都适用）。
   // 注意：该库 PostgREST 对 .upsert() 的合并在「行已存在」时会 409，故改用
   // 「先 insert，若 409 重复键则降级为 update(PATCH)」的稳妥写法。
+  async function readCloud() {
+    try {
+      const { data, error } = await sb.from(SYNC_TABLE).select('name').eq('id', SYNC_ROW_ID).maybeSingle();
+      if (error || !data || !data.name) return null;
+      const b = JSON.parse(data.name);
+      return (b && Array.isArray(b.ledgers) && Array.isArray(b.transactions)) ? b : null;
+    } catch (e) { return null; }
+  }
+  async function writeCloud(blob) {
+    const payload = { id: SYNC_ROW_ID, name: JSON.stringify(blob), icon: '', color: '' };
+    let res = await sb.from(SYNC_TABLE).insert(payload);
+    if (res.error && /23505|duplicate/i.test(res.error.code || res.error.message || '')) {
+      res = await sb.from(SYNC_TABLE).update({ name: payload.name, icon: '', color: '' }).eq('id', SYNC_ROW_ID);
+    }
+    return !res.error;
+  }
   async function pushState() {
     if (!cloudOn || !sb) return;
     try {
-      const payload = { id: SYNC_ROW_ID, name: JSON.stringify(normalizeBlob(buildBlob())), icon: '', color: '' };
-      let res = await sb.from(SYNC_TABLE).insert(payload);
-      if (res.error && /23505|duplicate/i.test(res.error.code || res.error.message || '')) {
-        res = await sb.from(SYNC_TABLE).update({ name: payload.name, icon: '', color: '' }).eq('id', SYNC_ROW_ID);
-      }
-      if (res.error) return;
+      const local = buildBlob();
+      const cloud = await readCloud();
+      const merged = normalizeBlob(cloud ? mergeStates(local, cloud).blob : local);
+      if (!(await writeCloud(merged))) return;
+      writeDeleted(merged.deleted || {});
+      applyBlob(merged);                                  // 合并结果落到本地（顺带带回别处的新记录）
       localStorage.setItem(LS.dirty, '0');
       localStorage.setItem(LS.lastSync, new Date().toISOString());
       if (onCloudChangeCb) onCloudChangeCb(false); // 仅刷新状态指示，不整页重载（避免闪烁）
@@ -207,7 +272,9 @@ const Store = (() => {
            readArr(LS.transactions).length > 0 || readArr(LS.budgets).length > 0 ||
            readArr(LS.assets).length > 0 || readArr(LS.recurring).length > 0;
   }
-  // 拉取云端（云端为权威）；本地有未同步改动时只推不拉（拉取守卫）；云端空/损坏且本地有数据时只推不拉
+  // 拉取：读云端 → 与本地逐条合并（同 id 取 updated_at 较新者；删除按墓碑时间裁决）
+  // → 结果落回本地；若本端还有云端没有的更新/删除，则立刻回传。
+  // 这里不再需要"有改动就只推不拉"的守卫：合并本身保证了「较新者为准」。
   async function pull() {
     if (!cloudOn || !sb) return;
     try {
@@ -217,26 +284,24 @@ const Store = (() => {
         await pushState();
         return;
       }
-      let blob = null;
-      try { blob = JSON.parse(data.name); } catch (e) { blob = null; }
-      const valid = blob && Array.isArray(blob.ledgers) && Array.isArray(blob.transactions);
-      // 先合并墓碑（本机 + 云端），并立即把已删除记录从本地清掉：
-      // 删除优先级高于"整份覆盖"，保证本地刚删的记录不会被云端文档带回来。
-      const merged = mergeTombstones(readDeleted(), (valid && blob && blob.deleted) || {});
-      writeDeleted(merged);
-      const purged = purgeDeleted(merged);
-      if (isDirty()) {                   // 拉取守卫：本地有未同步改动 → 只推不拉，避免覆盖刚做的操作
-        await pushState();
-        return;
-      }
+      let cloud = null;
+      try { cloud = JSON.parse(data.name); } catch (e) { cloud = null; }
+      const valid = cloud && Array.isArray(cloud.ledgers) && Array.isArray(cloud.transactions);
       if (!valid) {                      // 云端空/损坏，且本地有数据 → 推本地，绝不反向清空本地
         if (localHasData()) await pushState();
         return;
       }
-      applyBlob(normalizeBlob(blob));    // 先归一并账本，再整体替换本地（云端为权威）
-      purgeDeleted(merged);              // 云端文档里若还残留已删除记录，再清一次
+      const before = blobSig(buildBlob());
+      const { blob, localNewer } = mergeStates(buildBlob(), cloud);
+      const merged = normalizeBlob(blob);
+      writeDeleted(merged.deleted || {});
+      applyBlob(merged);
+      purgeDeleted(merged.deleted || {});
       localStorage.setItem(LS.lastSync, data.updated_at || new Date().toISOString());
-      if (onCloudChangeCb) onCloudChangeCb(true); // 传入 true → 整页重载
+      if (!localNewer) localStorage.setItem(LS.dirty, '0');
+      const changed = blobSig(merged) !== before;
+      if (onCloudChangeCb) onCloudChangeCb(changed);   // 内容确有变化才整页重载（避免每 30s 白重渲染）
+      if (localNewer) await pushState();               // 本端更新/删除尚未上云 → 回传
     } catch (e) { }
   }
   function flush() { if (cloudOn && isDirty()) pushState(); } // 离开页面兜底（best-effort）
@@ -296,6 +361,7 @@ const Store = (() => {
   function getLedgers() { return readArr(LS.ledgers).filter(x => x.id !== SYNC_ROW_ID); }
   async function saveLedger(obj) {
     const o = { ...obj };
+    o.updated_at = new Date().toISOString();   // 逐条时间戳：多端合并「较新者为准」的依据
     if (!o.id) o.id = uid();
     const arr = readArr(LS.ledgers);
     const i = arr.findIndex(x => x.id === o.id);
@@ -314,6 +380,7 @@ const Store = (() => {
   function getCategories() { return readArr(LS.categories); }
   async function saveCategory(obj) {
     const o = { ...obj };
+    o.updated_at = new Date().toISOString();   // 逐条时间戳：多端合并「较新者为准」的依据
     if (!o.id) o.id = uid();
     const arr = readArr(LS.categories);
     const i = arr.findIndex(x => x.id === o.id);
@@ -338,6 +405,7 @@ const Store = (() => {
   }
   async function saveTransaction(obj) {
     const o = { ...obj };
+    o.updated_at = new Date().toISOString();   // 逐条时间戳：多端合并「较新者为准」的依据
     if (!o.id) o.id = uid();
     if (!o.created_at) o.created_at = new Date().toISOString();
     const arr = readArr(LS.transactions);
@@ -358,6 +426,7 @@ const Store = (() => {
   function getRecurring() { return readArr(LS.recurring); }
   async function saveRecurring(obj) {
     const o = { ...obj };
+    o.updated_at = new Date().toISOString();   // 逐条时间戳：多端合并「较新者为准」的依据
     if (!o.id) o.id = uid();
     if (!o.created_at) o.created_at = new Date().toISOString();
     const arr = readArr(LS.recurring);
@@ -382,6 +451,7 @@ const Store = (() => {
   }
   async function saveBudget(obj) {
     const o = { ...obj };
+    o.updated_at = new Date().toISOString();   // 逐条时间戳：多端合并「较新者为准」的依据
     if (!o.id) o.id = uid();
     const arr = readArr(LS.budgets);
     const i = arr.findIndex(x => x.id === o.id);
@@ -402,6 +472,7 @@ const Store = (() => {
   }
   async function saveAsset(obj) {
     const o = { ...obj };
+    o.updated_at = new Date().toISOString();   // 逐条时间戳：多端合并「较新者为准」的依据
     if (!o.id) o.id = uid();
     const arr = readArr(LS.assets);
     const i = arr.findIndex(x => x.id === o.id);
